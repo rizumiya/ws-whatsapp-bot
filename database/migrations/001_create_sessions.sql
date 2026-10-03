@@ -1,0 +1,12 @@
+-- 1. Registry data sesi
+CREATE TABLE IF NOT EXISTS sessions (
+    id VARCHAR(100) PRIMARY KEY,
+    phone_number VARCHAR(30) NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'IDLE', -- IDLE, CONNECTING, CONNECTED, LOGGED_OUT
+    webhook_url TEXT NULL,
+    api_key VARCHAR(128) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
