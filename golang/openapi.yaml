@@ -1,0 +1,960 @@
+openapi: 3.0.3
+info:
+  title: WhatsApp Multi-Session Bot API
+  version: 1.0.0
+  description: |
+    REST API untuk mengirim pesan dan mengelola sesi WhatsApp berbasis Baileys.
+
+    ## Autentikasi
+    Semua endpoint memerlukan API Key di header `x-api-key`.
+    - **Master API Key**: Untuk endpoint admin (buat/hapus sesi). Diambil dari `.env`.
+    - **Session API Key**: Untuk endpoint per-sesi (kirim pesan, grup, dll). Didapat saat membuat sesi baru.
+
+servers:
+  - url: http://localhost:3000/api/v1
+    description: Local Development Server
+
+components:
+  securitySchemes:
+    MasterApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Master API Key (dari .env) — untuk endpoint admin.
+    SessionApiKey:
+      type: apiKey
+      in: header
+      name: x-api-key
+      description: Session API Key atau Master API Key — untuk endpoint per-sesi.
+
+  schemas:
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+
+    JID:
+      type: string
+      description: "Format: nomor@s.whatsapp.net (pribadi) atau id@g.us (grup)"
+      example: "628123456789@s.whatsapp.net"
+
+  parameters:
+    SessionId:
+      name: sessionId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: ID sesi yang sudah didaftarkan
+      example: "bot-admin-1"
+
+    GroupJid:
+      name: jid
+      in: path
+      required: true
+      schema:
+        type: string
+      description: "JID grup (format: id@g.us)"
+      example: "120363012345678901@g.us"
+
+    MessageId:
+      name: messageId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: ID pesan WhatsApp
+
+tags:
+  - name: Sessions
+    description: Manajemen sesi / akun WhatsApp
+  - name: Messaging
+    description: Kirim pesan teks, media, lokasi, reaksi, dan revoke
+  - name: Groups
+    description: Kelola grup WhatsApp
+  - name: Chats
+    description: Interaksi chat (read receipt, presence/typing)
+  - name: Calls
+    description: Melakukan dan menerima panggilan telepon (Accept, Reject, Offer)
+    description: Interaksi chat (read receipt, presence/typing)
+
+paths:
+  # ──────────────────────────────────────────────
+  #  SESSION ENDPOINTS
+  # ──────────────────────────────────────────────
+  /sessions:
+    get:
+      tags: [Sessions]
+      summary: Daftar Semua Sesi
+      description: Menampilkan semua sesi yang terdaftar di database.
+      security:
+        - MasterApiKey: []
+      responses:
+        '200':
+          description: Daftar sesi berhasil diambil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            id:
+                              type: string
+                              example: "bot-admin-1"
+                            phone_number:
+                              type: string
+                              example: "628123456789"
+                            status:
+                              type: string
+                              enum: [IDLE, STARTING, QR_PENDING, CONNECTED, DISCONNECTED, LOGGED_OUT]
+                            webhook_url:
+                              type: string
+                              nullable: true
+                            created_at:
+                              type: string
+                              format: date-time
+        '401':
+          description: Master API Key tidak valid
+
+    post:
+      tags: [Sessions]
+      summary: Buat Sesi Baru
+      description: |
+        Mendaftarkan nomor WhatsApp baru ke server.
+        Response akan mengembalikan `apiKey` yang **hanya ditampilkan sekali**.
+        Simpan API Key ini baik-baik untuk digunakan di endpoint lainnya.
+      security:
+        - MasterApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sessionId]
+              properties:
+                sessionId:
+                  type: string
+                  minLength: 3
+                  maxLength: 64
+                  pattern: '^[a-zA-Z0-9_-]+$'
+                  description: ID unik untuk sesi (hanya alfanumerik, dash, underscore)
+                  example: "bot-admin-1"
+                webhookUrl:
+                  type: string
+                  format: uri
+                  description: URL yang akan menerima notifikasi event (pesan masuk, dsb)
+                  example: "https://my-app.com/webhook"
+      responses:
+        '200':
+          description: Sesi berhasil dibuat
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          sessionId:
+                            type: string
+                            example: "bot-admin-1"
+                          apiKey:
+                            type: string
+                            description: "⚠️ SIMPAN! Hanya ditampilkan sekali."
+                            example: "a1b2c3d4e5f6..."
+                          status:
+                            type: string
+                            example: "STARTING"
+        '400':
+          description: Sesi sudah ada
+        '401':
+          description: Master API Key tidak valid
+
+  /sessions/{sessionId}/status:
+    get:
+      tags: [Sessions]
+      summary: Cek Status Sesi
+      description: Mengembalikan informasi detail sesi (status koneksi, nomor telepon, dll).
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Status sesi berhasil diambil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          id:
+                            type: string
+                          phone_number:
+                            type: string
+                          status:
+                            type: string
+                            enum: [IDLE, STARTING, QR_PENDING, CONNECTED, DISCONNECTED, LOGGED_OUT]
+                          webhook_url:
+                            type: string
+                            nullable: true
+        '404':
+          description: Sesi tidak ditemukan
+
+  /sessions/{sessionId}/qr:
+    get:
+      tags: [Sessions]
+      summary: Ambil QR Code
+      description: |
+        Mengambil string QR Code yang bisa di-scan melalui WhatsApp > Linked Devices.
+        QR hanya tersedia selama ~60 detik setelah sesi dibuat.
+        Gunakan library seperti `qrcode` untuk mengubah string ini menjadi gambar QR.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: QR Code berhasil diambil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          qr:
+                            type: string
+                            description: String QR yang perlu dirender menjadi gambar QR Code
+        '404':
+          description: QR tidak tersedia (sesi mungkin sudah terhubung atau belum dimulai)
+
+  /sessions/{sessionId}/pairing-code:
+    post:
+      tags: [Sessions]
+      summary: Minta Pairing Code (Login tanpa QR)
+      description: |
+        Alternatif login tanpa scan QR. Server akan mengirim kode 8 digit
+        yang bisa dimasukkan di WhatsApp > Linked Devices > Link with phone number.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [phoneNumber]
+              properties:
+                phoneNumber:
+                  type: string
+                  description: Nomor telepon tanpa +, spasi, atau tanda hubung
+                  example: "628123456789"
+      responses:
+        '200':
+          description: Pairing code berhasil digenerate
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          code:
+                            type: string
+                            description: Kode 8 digit untuk dimasukkan di WhatsApp
+                            example: "ABCD-EFGH"
+        '400':
+          description: Socket belum aktif
+
+  /sessions/{sessionId}/restart:
+    post:
+      tags: [Sessions]
+      summary: Restart Sesi
+      description: Menutup koneksi sesi lalu membuat koneksi ulang tanpa menghapus kredensial.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Restart berhasil dimulai
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: string
+                        example: "Session restart initiated"
+
+  /sessions/{sessionId}/logout:
+    delete:
+      tags: [Sessions]
+      summary: Logout & Hapus Sesi
+      description: |
+        Melakukan logout dari WhatsApp, menghapus kredensial auth dari database,
+        dan menghapus socket dari memory. Sesi tidak bisa dipulihkan setelah ini.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Logout berhasil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      message:
+                        type: string
+                        example: "Session logged out and deleted"
+
+  # ──────────────────────────────────────────────
+  #  MESSAGING ENDPOINTS
+  # ──────────────────────────────────────────────
+  /sessions/{sessionId}/messages/text:
+    post:
+      tags: [Messaging]
+      summary: Kirim Pesan Teks
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, text]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                text:
+                  type: string
+                  minLength: 1
+                  example: "Halo dari API!"
+                quotedMessageId:
+                  type: string
+                  description: ID pesan yang ingin di-reply/quote (opsional)
+      responses:
+        '200':
+          description: Pesan berhasil terkirim
+        '500':
+          description: Gagal mengirim pesan
+
+  /sessions/{sessionId}/messages/media:
+    post:
+      tags: [Messaging]
+      summary: Kirim Media (Gambar/Video/Audio/Dokumen/Sticker)
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, type]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                type:
+                  type: string
+                  enum: [image, video, audio, document, sticker]
+                  description: Jenis media
+                url:
+                  type: string
+                  format: uri
+                  description: URL publik ke file media (pilih salah satu url ATAU base64)
+                  example: "https://contoh.com/gambar.jpg"
+                base64:
+                  type: string
+                  description: |
+                    Konten file dalam format Base64, boleh juga data URL (`data:image/png;base64,...`).
+                    Pilih salah satu url ATAU base64. Seluruh badan permintaan dibatasi
+                    MEDIA_BODY_LIMIT (default 25mb, kira-kira file 18 MB); file lebih besar kirim lewat url.
+                    Melebihi batas -> 413 PAYLOAD_TOO_LARGE.
+                caption:
+                  type: string
+                  description: Teks keterangan (untuk image, video, document)
+                  example: "Lihat foto ini!"
+                fileName:
+                  type: string
+                  description: Nama file (khusus untuk type document)
+                  example: "laporan.pdf"
+                mimetype:
+                  type: string
+                  description: MIME type file (opsional, auto-detect jika tidak diisi)
+                  example: "image/jpeg"
+                ptt:
+                  type: boolean
+                  description: "Kirim sebagai voice note? (khusus type: audio)"
+                  default: false
+                quotedMessageId:
+                  type: string
+                  description: ID pesan yang ingin di-reply/quote (opsional)
+      responses:
+        '200':
+          description: Media berhasil terkirim
+        '500':
+          description: Gagal mengirim media
+
+  /sessions/{sessionId}/messages/location:
+    post:
+      tags: [Messaging]
+      summary: Kirim Lokasi
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, latitude, longitude]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                latitude:
+                  type: number
+                  example: -6.2088
+                longitude:
+                  type: number
+                  example: 106.8456
+                name:
+                  type: string
+                  description: Nama tempat (opsional)
+                  example: "Monas"
+                address:
+                  type: string
+                  description: Alamat lengkap (opsional)
+                  example: "Jakarta Pusat, DKI Jakarta"
+      responses:
+        '200':
+          description: Lokasi berhasil terkirim
+
+  /sessions/{sessionId}/messages/react:
+    post:
+      tags: [Messaging]
+      summary: Beri Reaksi Emoji pada Pesan
+      description: Kirim string kosong pada `emoji` untuk menghapus reaksi.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, messageId, emoji]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                messageId:
+                  type: string
+                  description: ID pesan yang ingin diberi reaksi
+                emoji:
+                  type: string
+                  description: "Emoji reaksi. Kirim string kosong ('') untuk menghapus reaksi."
+                  example: "❤️"
+      responses:
+        '200':
+          description: Reaksi berhasil dikirim
+
+  /sessions/{sessionId}/messages/revoke:
+    post:
+      tags: [Messaging]
+      summary: Tarik / Hapus Pesan (Unsend)
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, messageId]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                messageId:
+                  type: string
+                  description: ID pesan yang ingin ditarik/dihapus
+                fromMe:
+                  type: boolean
+                  description: Apakah pesan ini dikirim oleh akun ini?
+                  default: true
+      responses:
+        '200':
+          description: Pesan berhasil ditarik
+
+  /sessions/{sessionId}/messages/{messageId}/download:
+    get:
+      tags: [Messaging]
+      summary: Unduh Media dari Pesan
+      description: |
+        Mengunduh file media (gambar/video/audio/dokumen) dari pesan yang masuk.
+        Media di-cache selama 24 jam setelah diterima. Setelah 24 jam, media tidak bisa diunduh lagi.
+        Response berupa binary file (bukan JSON).
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/MessageId'
+      responses:
+        '200':
+          description: File media berhasil diunduh
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Media tidak ditemukan di cache (sudah melewati 24 jam)
+
+  # ──────────────────────────────────────────────
+  #  GROUP ENDPOINTS
+  # ──────────────────────────────────────────────
+  /sessions/{sessionId}/groups:
+    post:
+      tags: [Groups]
+      summary: Buat Grup Baru
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, participants]
+              properties:
+                subject:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  description: Nama grup
+                  example: "Grup Kerja Tim A"
+                participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/JID'
+                  description: Daftar JID anggota yang akan ditambahkan
+                  example: ["628111111111@s.whatsapp.net", "628222222222@s.whatsapp.net"]
+      responses:
+        '200':
+          description: Grup berhasil dibuat
+
+  /sessions/{sessionId}/groups/{jid}:
+    get:
+      tags: [Groups]
+      summary: Ambil Info / Metadata Grup
+      description: Menampilkan nama grup, deskripsi, daftar anggota, dan admin.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      responses:
+        '200':
+          description: Metadata grup berhasil diambil
+
+  /sessions/{sessionId}/groups/{jid}/participants/add:
+    post:
+      tags: [Groups]
+      summary: Tambah Anggota ke Grup
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participants]
+              properties:
+                participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/JID'
+                  example: ["628333333333@s.whatsapp.net"]
+      responses:
+        '200':
+          description: Anggota berhasil ditambahkan
+
+  /sessions/{sessionId}/groups/{jid}/participants/remove:
+    post:
+      tags: [Groups]
+      summary: Keluarkan Anggota dari Grup
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participants]
+              properties:
+                participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/JID'
+      responses:
+        '200':
+          description: Anggota berhasil dikeluarkan
+
+  /sessions/{sessionId}/groups/{jid}/participants/promote:
+    post:
+      tags: [Groups]
+      summary: Jadikan Anggota sebagai Admin
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participants]
+              properties:
+                participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/JID'
+      responses:
+        '200':
+          description: Anggota berhasil di-promote
+
+  /sessions/{sessionId}/groups/{jid}/participants/demote:
+    post:
+      tags: [Groups]
+      summary: Turunkan Admin Menjadi Anggota Biasa
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [participants]
+              properties:
+                participants:
+                  type: array
+                  minItems: 1
+                  items:
+                    $ref: '#/components/schemas/JID'
+      responses:
+        '200':
+          description: Admin berhasil di-demote
+
+  /sessions/{sessionId}/groups/{jid}/subject:
+    patch:
+      tags: [Groups]
+      summary: Ubah Nama Grup
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject]
+              properties:
+                subject:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                  example: "Nama Grup Baru"
+      responses:
+        '200':
+          description: Nama grup berhasil diubah
+
+  /sessions/{sessionId}/groups/{jid}/description:
+    patch:
+      tags: [Groups]
+      summary: Ubah Deskripsi Grup
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [description]
+              properties:
+                description:
+                  type: string
+                  example: "Deskripsi baru untuk grup ini"
+      responses:
+        '200':
+          description: Deskripsi grup berhasil diubah
+
+  /sessions/{sessionId}/groups/{jid}/invite:
+    get:
+      tags: [Groups]
+      summary: Ambil Link Undangan Grup
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+        - $ref: '#/components/parameters/GroupJid'
+      responses:
+        '200':
+          description: Link undangan berhasil diambil
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          code:
+                            type: string
+                            example: "AbCdEfGhIjK"
+                          url:
+                            type: string
+                            example: "https://chat.whatsapp.com/AbCdEfGhIjK"
+
+  # ──────────────────────────────────────────────
+  #  CHAT ENDPOINTS
+  # ──────────────────────────────────────────────
+  /sessions/{sessionId}/chats/read:
+    post:
+      tags: [Chats]
+      summary: Tandai Pesan Sudah Dibaca (Centang Biru)
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, messageId]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                messageId:
+                  type: string
+                  description: ID pesan yang ingin ditandai sebagai sudah dibaca
+      responses:
+        '200':
+          description: Pesan berhasil ditandai sebagai sudah dibaca
+
+  /sessions/{sessionId}/chats/presence:
+    post:
+      tags: [Chats]
+      summary: Ubah Status Presence (Sedang Mengetik, Merekam, dll)
+      description: |
+        Menampilkan status "Sedang mengetik..." atau "Sedang merekam..." pada chat tujuan.
+        Status akan otomatis hilang setelah beberapa detik.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, presence]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                presence:
+                  type: string
+                  enum: [composing, recording, paused]
+                  description: |
+                    - `composing` = Sedang mengetik...
+                    - `recording` = Sedang merekam...
+                    - `paused` = Berhenti mengetik
+      responses:
+        '200':
+          description: Presence berhasil diubah
+
+  # ──────────────────────────────────────────────
+  #  CALL ENDPOINTS (GOLANG SPECIFIC)
+  # ──────────────────────────────────────────────
+  /sessions/{sessionId}/calls/reject:
+    post:
+      tags: [Calls]
+      summary: Reject an Incoming Call
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, callId]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                  description: "JID of the caller"
+                callId:
+                  type: string
+                  description: "ID of the call to reject"
+      responses:
+        '200':
+          description: Call rejected
+
+  /sessions/{sessionId}/calls/accept:
+    post:
+      tags: [Calls]
+      summary: Accept an Incoming Call (WebRTC Initiation)
+      description: |
+        Send a raw accept node. This endpoint mimics the WebRTC accept behavior by triggering the accept event.
+        Requires external WebRTC logic if you want audio to flow.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to, callId]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                  description: "JID of the caller"
+                callId:
+                  type: string
+                  description: "ID of the call to accept"
+      responses:
+        '200':
+          description: Call accepted node sent
+
+  /sessions/{sessionId}/calls/offer:
+    post:
+      tags: [Calls]
+      summary: Offer / Initiate a New Call
+      description: |
+        Initiate a call towards a JID. This will make the target's phone ring.
+      security:
+        - SessionApiKey: []
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to]
+              properties:
+                to:
+                  $ref: '#/components/schemas/JID'
+                  description: "JID of the target"
+                mediaType:
+                  type: string
+                  enum: [audio, video]
+                  default: audio
+                  description: "Type of call to initiate"
+      responses:
+        '200':
+          description: Call offer initiated
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessResponse'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          callId:
+                            type: string
+                            description: "Generated Call ID for the initiated call"
