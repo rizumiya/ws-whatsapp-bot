@@ -3,10 +3,14 @@ package handlers
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"go.mau.fi/whatsmeow"
@@ -16,6 +20,55 @@ import (
 
 	"golang-whatsapp-bot/internal/whatsapp"
 )
+
+const maxRemoteMediaBytes = 20 * 1024 * 1024 // 20 MB
+
+var mediaHTTPClient = &http.Client{
+	Timeout: 15 * time.Second,
+}
+
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		// CGNAT 100.64.0.0/10
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+	}
+	return false
+}
+
+func validateExternalMediaURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return "", errors.New("only http and https media URLs are allowed")
+	}
+	host := parsed.Hostname()
+	if host == "" || host == "localhost" || strings.HasSuffix(host, ".local") || strings.HasSuffix(host, ".internal") {
+		return "", errors.New("fetching media from local or internal hostnames is not allowed")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if isPrivateIP(ip) {
+			return "", errors.New("fetching media from private or loopback IP addresses is not allowed")
+		}
+		return parsed.String(), nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return "", errors.New("failed to resolve media URL hostname")
+	}
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return "", errors.New("media URL resolves to a private or disallowed IP address")
+		}
+	}
+	return parsed.String(), nil
+}
 
 func parseJID(arg string) (types.JID, bool) {
 	if arg == "" {
@@ -34,12 +87,14 @@ func parseJID(arg string) (types.JID, bool) {
 	return recipient, true
 }
 
-func getContextInfo(quotedMessageId string) *waProto.ContextInfo {
+func getContextInfo(quotedMessageId string, remoteJID types.JID) *waProto.ContextInfo {
 	if quotedMessageId == "" {
 		return nil
 	}
 	return &waProto.ContextInfo{
-		StanzaID: proto.String(quotedMessageId),
+		StanzaID:      proto.String(quotedMessageId),
+		Participant:   proto.String(remoteJID.ToNonAD().String()),
+		QuotedMessage: &waProto.Message{Conversation: proto.String("")},
 	}
 }
 
@@ -52,8 +107,8 @@ type TextMsgReq struct {
 func SendText(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req TextMsgReq
@@ -69,7 +124,7 @@ func SendText(c *fiber.Ctx) error {
 	msg := &waProto.Message{
 		ExtendedTextMessage: &waProto.ExtendedTextMessage{
 			Text:        proto.String(req.Text),
-			ContextInfo: getContextInfo(req.QuotedMessageId),
+			ContextInfo: getContextInfo(req.QuotedMessageId, jid),
 		},
 	}
 
@@ -101,8 +156,8 @@ type MediaMsgReq struct {
 func SendMedia(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req MediaMsgReq
@@ -129,14 +184,30 @@ func SendMedia(c *fiber.Ctx) error {
 			return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Invalid base64 string"}})
 		}
 	} else if req.URL != "" {
-		resp, err := http.Get(req.URL)
+		safeURL, urlErr := validateExternalMediaURL(req.URL)
+		if urlErr != nil {
+			return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": urlErr.Error()}})
+		}
+		resp, err := mediaHTTPClient.Get(safeURL)
 		if err != nil || resp.StatusCode != 200 {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
 			return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to fetch media from URL"}})
 		}
 		defer resp.Body.Close()
-		mediaData, err = io.ReadAll(resp.Body)
+
+		if resp.ContentLength > maxRemoteMediaBytes {
+			return c.Status(413).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Remote media exceeds 20 MB limit"}})
+		}
+
+		limitedReader := io.LimitReader(resp.Body, maxRemoteMediaBytes+1)
+		mediaData, err = io.ReadAll(limitedReader)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to read media body"}})
+		}
+		if len(mediaData) > maxRemoteMediaBytes {
+			return c.Status(413).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Remote media exceeds 20 MB limit"}})
 		}
 		if req.Mimetype == "" {
 			req.Mimetype = resp.Header.Get("Content-Type")
@@ -151,11 +222,16 @@ func SendMedia(c *fiber.Ctx) error {
 
 	var waMediaType whatsmeow.MediaType
 	switch req.Type {
-	case "image": waMediaType = whatsmeow.MediaImage
-	case "video": waMediaType = whatsmeow.MediaVideo
-	case "audio": waMediaType = whatsmeow.MediaAudio
-	case "document": waMediaType = whatsmeow.MediaDocument
-	default: waMediaType = whatsmeow.MediaDocument // fallback
+	case "image", "sticker":
+		waMediaType = whatsmeow.MediaImage
+	case "video":
+		waMediaType = whatsmeow.MediaVideo
+	case "audio":
+		waMediaType = whatsmeow.MediaAudio
+	case "document":
+		waMediaType = whatsmeow.MediaDocument
+	default:
+		waMediaType = whatsmeow.MediaDocument
 	}
 
 	uploaded, err := session.Client.Upload(context.Background(), mediaData, waMediaType)
@@ -164,7 +240,7 @@ func SendMedia(c *fiber.Ctx) error {
 	}
 
 	msg := &waProto.Message{}
-	ctxInfo := getContextInfo(req.QuotedMessageId)
+	ctxInfo := getContextInfo(req.QuotedMessageId, jid)
 
 	switch req.Type {
 	case "image":
@@ -253,8 +329,8 @@ type LocationMsgReq struct {
 func SendLocation(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req LocationMsgReq
@@ -298,8 +374,8 @@ type ReactMsgReq struct {
 func SendReaction(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req ReactMsgReq
@@ -330,8 +406,8 @@ type RevokeMsgReq struct {
 func RevokeMessage(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req RevokeMsgReq
@@ -356,14 +432,37 @@ func RevokeMessage(c *fiber.Ctx) error {
 
 func DownloadMedia(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
-	_, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	messageID := c.Params("messageId")
+
+	session, ok := whatsapp.Manager.GetSession(sessionID)
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
-	// This is a complex functionality because whatsmeow doesn't store media locally like Baileys.
-	// A proper implementation would require storing Message data upon receipt, grabbing the MediaKey/URL,
-	// and using whatsmeow.Download() then returning the bytes.
-	// Due to architectural constraints, this is stubbed for future implementation.
-	return c.Status(501).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Media download requires message storage which is not implemented in this boilerplate"}})
+	cached, found := whatsapp.Manager.GetCachedMedia(sessionID, messageID)
+	if !found || cached.Message == nil {
+		return c.Status(404).JSON(fiber.Map{
+			"success": false,
+			"error": fiber.Map{
+				"code":    "NOT_FOUND",
+				"message": "Message media not found in cache. Media messages are only cached for 24 hours.",
+			},
+		})
+	}
+
+	data, err := session.Client.DownloadAny(context.Background(), cached.Message)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"success": false,
+			"error":   fiber.Map{"message": fmt.Sprintf("Failed to download media: %v", err)},
+		})
+	}
+
+	mimetype := cached.Mimetype
+	if mimetype == "" {
+		mimetype = "application/octet-stream"
+	}
+
+	c.Set("Content-Type", mimetype)
+	return c.Send(data)
 }

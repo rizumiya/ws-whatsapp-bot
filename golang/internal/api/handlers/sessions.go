@@ -1,14 +1,16 @@
 package handlers
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"regexp"
 
 	"github.com/gofiber/fiber/v2"
-	"context"
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
+	"golang-whatsapp-bot/internal/api/middlewares"
 	"golang-whatsapp-bot/internal/database"
 	"golang-whatsapp-bot/internal/whatsapp"
 )
@@ -26,8 +28,16 @@ func GetSessions(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{
 			"success": false,
-			"error": fiber.Map{"message": "Failed to retrieve sessions"},
+			"error":   fiber.Map{"message": "Failed to retrieve sessions"},
 		})
+	}
+	for i := range sessions {
+		if id, ok := sessions[i]["id"].(string); ok {
+			sessions[i]["runtime"] = whatsapp.Manager.RuntimeState(id)
+			if session, exists := whatsapp.Manager.GetSession(id); exists && session.Client.Store.ID != nil {
+				sessions[i]["phone_number"] = session.Client.Store.ID.User
+			}
+		}
 	}
 	return c.JSON(fiber.Map{
 		"success": true,
@@ -48,17 +58,20 @@ func CreateSession(c *fiber.Ctx) error {
 
 	match, _ := regexp.MatchString("^[a-zA-Z0-9_-]+$", req.SessionID)
 	if !match || len(req.SessionID) < 3 || len(req.SessionID) > 64 {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Invalid sessionId format"}})
+		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "VALIDATION_ERROR", "message": "Invalid sessionId format"}})
 	}
 
 	// Check if exists
 	_, _, _, _, err := database.GetSessionData(req.SessionID)
 	if err == nil {
-		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session already exists"}})
+		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "ALREADY_EXISTS", "message": "Session already exists"}})
 	}
 
-	apiKey := GenerateAPIKey()
-	database.SaveSessionData(req.SessionID, apiKey, req.WebhookURL, "STARTING")
+	plainAPIKey := GenerateAPIKey()
+	hashedAPIKey := middlewares.HashAPIKey(plainAPIKey)
+	if err := database.SaveSessionData(req.SessionID, hashedAPIKey, req.WebhookURL, "STARTING"); err != nil {
+		return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to save session"}})
+	}
 
 	_, err = whatsapp.InitSession(req.SessionID)
 	if err != nil {
@@ -69,7 +82,7 @@ func CreateSession(c *fiber.Ctx) error {
 		"success": true,
 		"data": fiber.Map{
 			"sessionId": req.SessionID,
-			"apiKey":    apiKey,
+			"apiKey":    plainAPIKey,
 			"status":    "STARTING",
 		},
 	})
@@ -77,15 +90,18 @@ func CreateSession(c *fiber.Ctx) error {
 
 func GetSessionStatus(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
-	_, webhookUrl, status, _, err := database.GetSessionData(sessionID)
+	_, webhookUrl, status, jidStr, err := database.GetSessionData(sessionID)
 	if err != nil {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not found"}})
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "NOT_FOUND", "message": "Session not found"}})
 	}
 
-	// Try to get phone number from client
 	phoneNumber := ""
 	if session, ok := whatsapp.Manager.GetSession(sessionID); ok && session.Client.Store.ID != nil {
 		phoneNumber = session.Client.Store.ID.User
+	} else if jidStr != "" {
+		if parsed, parseErr := types.ParseJID(jidStr); parseErr == nil {
+			phoneNumber = parsed.User
+		}
 	}
 
 	return c.JSON(fiber.Map{
@@ -95,6 +111,7 @@ func GetSessionStatus(c *fiber.Ctx) error {
 			"phone_number": phoneNumber,
 			"status":       status,
 			"webhook_url":  webhookUrl,
+			"runtime":      whatsapp.Manager.RuntimeState(sessionID),
 		},
 	})
 }
@@ -103,19 +120,15 @@ func GetQR(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
 	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "NOT_FOUND", "message": "Session not active"}})
 	}
 
-	// Try to grab the latest QR if QR channel is active
-	// Note: In whatsmeow, QR codes are pushed via channel.
-	// We need a mechanism to store the latest QR or fetch it.
-	// For simplicity, we can fetch from the channel non-blocking if possible.
-
-	if session.LatestQR != "" {
+	qr := session.GetLatestQR()
+	if qr != "" {
 		return c.JSON(fiber.Map{
 			"success": true,
 			"data": fiber.Map{
-				"qr": session.LatestQR,
+				"qr": qr,
 			},
 		})
 	}
@@ -124,7 +137,7 @@ func GetQR(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session already connected"}})
 	}
 
-	return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "QR not available, wait or restart"}})
+	return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "NOT_FOUND", "message": "QR not available, wait or restart"}})
 }
 
 type PairingCodeReq struct {
@@ -135,7 +148,7 @@ func GetPairingCode(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
 	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "NOT_ACTIVE", "message": "Session not active"}})
 	}
 
 	var req PairingCodeReq
@@ -145,7 +158,7 @@ func GetPairingCode(c *fiber.Ctx) error {
 
 	code, err := session.Client.PairPhone(context.Background(), req.PhoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": fmt.Sprintf("Failed to get pairing code: %v", err)}})
+		return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"code": "PAIRING_ERROR", "message": fmt.Sprintf("Failed to get pairing code: %v", err)}})
 	}
 
 	return c.JSON(fiber.Map{
@@ -158,19 +171,9 @@ func GetPairingCode(c *fiber.Ctx) error {
 
 func RestartSession(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
-	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if ok {
-		session.Client.Disconnect()
-		err := session.Client.Connect()
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to reconnect"}})
-		}
-	} else {
-		// Not in memory, try to re-init
-		_, err := whatsapp.InitSession(sessionID)
-		if err != nil {
-			return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to init session"}})
-		}
+	_, err := whatsapp.InitSession(sessionID)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Failed to restart session"}})
 	}
 
 	return c.JSON(fiber.Map{
@@ -184,11 +187,27 @@ func LogoutSession(c *fiber.Ctx) error {
 
 	session, ok := whatsapp.Manager.GetSession(sessionID)
 	if ok {
-		session.Client.Logout(context.Background())
+		if session.Client.IsConnected() && session.Client.IsLoggedIn() {
+			if err := session.Client.Logout(context.Background()); err != nil && session.Client.Store != nil {
+				_ = session.Client.Store.Delete(context.Background())
+			}
+		} else if session.Client.Store != nil && session.Client.Store.ID != nil {
+			_ = session.Client.Store.Delete(context.Background())
+		}
 		whatsapp.Manager.RemoveSession(sessionID)
+	} else {
+		// Clean up stored device from WhatsmeowStore if session wasn't in memory
+		_, _, _, jidStr, err := database.GetSessionData(sessionID)
+		if err == nil && jidStr != "" {
+			if jid, parseErr := types.ParseJID(jidStr); parseErr == nil {
+				if dev, devErr := database.WhatsmeowStore.GetDevice(context.Background(), jid); devErr == nil && dev != nil {
+					_ = dev.Delete(context.Background())
+				}
+			}
+		}
 	}
 
-	database.DeleteSessionData(sessionID)
+	_ = database.DeleteSessionData(sessionID)
 
 	return c.JSON(fiber.Map{
 		"success": true,

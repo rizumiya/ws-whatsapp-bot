@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"context"
-	"time"
 	"fmt"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"go.mau.fi/whatsmeow/types"
@@ -14,13 +14,14 @@ import (
 type ReadMsgReq struct {
 	To        string `json:"to"`
 	MessageId string `json:"messageId"`
+	Sender    string `json:"sender,omitempty"`
 }
 
 func MarkRead(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() || session.Client.Store.ID == nil {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req ReadMsgReq
@@ -33,8 +34,14 @@ func MarkRead(c *fiber.Ctx) error {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Invalid JID"}})
 	}
 
-	// For read receipts, Whatsmeow uses MarkRead with message IDs
-	err := session.Client.MarkRead(context.Background(), []types.MessageID{req.MessageId}, time.Now(), jid, session.Client.Store.ID.ToNonAD())
+	var senderJID types.JID
+	if req.Sender != "" {
+		if parsedSender, valid := parseJID(req.Sender); valid {
+			senderJID = parsedSender
+		}
+	}
+
+	err := session.Client.MarkRead(context.Background(), []types.MessageID{req.MessageId}, time.Now(), jid, senderJID)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": fmt.Sprintf("Failed to mark as read: %v", err)}})
 	}
@@ -50,8 +57,8 @@ type PresenceReq struct {
 func UpdatePresence(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req PresenceReq
@@ -69,13 +76,12 @@ func UpdatePresence(c *fiber.Ctx) error {
 	case "composing":
 		state = types.ChatPresenceComposing
 	case "recording":
-		state = types.ChatPresenceComposing // We'll differentiate by mediaType below
+		state = types.ChatPresenceComposing
 	case "paused":
 		state = types.ChatPresencePaused
 	default:
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Invalid presence state"}})
 	}
-
 
 	var mediaType types.ChatPresenceMedia
 	if req.Presence == "recording" {

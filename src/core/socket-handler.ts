@@ -2,7 +2,9 @@ import makeWASocket, {
   DisconnectReason,
   WASocket,
   ConnectionState,
-  fetchLatestBaileysVersion
+  fetchLatestBaileysVersion,
+  BufferJSON,
+  WAVersion
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import { logger } from '../utils/logger';
@@ -11,6 +13,26 @@ import { sessionRepository } from '../repositories/session.repository';
 import { dispatchWebhook } from './event-dispatcher';
 import { redis } from '../config/redis';
 
+let cachedVersion: WAVersion | null = null;
+let cachedVersionAt = 0;
+const VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+const getWhatsAppVersion = async (): Promise<WAVersion | undefined> => {
+  const now = Date.now();
+  if (cachedVersion && now - cachedVersionAt < VERSION_CACHE_TTL_MS) {
+    return cachedVersion;
+  }
+  try {
+    const { version } = await fetchLatestBaileysVersion();
+    cachedVersion = version;
+    cachedVersionAt = now;
+    return version;
+  } catch (err) {
+    logger.warn({ err }, 'Failed to fetch latest Baileys version, falling back to bundled default');
+    return cachedVersion || undefined;
+  }
+};
+
 export const startSocket = async (
   sessionId: string,
   onQR?: (qr: string) => void,
@@ -18,10 +40,10 @@ export const startSocket = async (
   onDisconnected?: (reason: number) => void
 ): Promise<WASocket> => {
   const { state, saveCreds, clearState } = await usePostgresAuthState(sessionId);
-  const { version } = await fetchLatestBaileysVersion();
+  const version = await getWhatsAppVersion();
 
   const sock = makeWASocket({
-    version,
+    ...(version ? { version } : {}),
     auth: state,
     printQRInTerminal: false,
     logger: logger.child({ module: 'baileys', sessionId }) as any,
@@ -70,8 +92,8 @@ export const startSocket = async (
       const msgContent = msg.message.imageMessage || msg.message.videoMessage || msg.message.audioMessage || msg.message.documentMessage || msg.message.stickerMessage;
       
       if (msgContent && msg.key.id) {
-        // Cache full WAMessage object
-        await redis.set(`message:${sessionId}:${msg.key.id}`, JSON.stringify(msg), 'EX', 86400);
+        // Cache full WAMessage object with BufferJSON.replacer so mediaKey/fileSha256 Buffers survive serialization
+        await redis.set(`message:${sessionId}:${msg.key.id}`, JSON.stringify(msg, BufferJSON.replacer), 'EX', 86400);
       }
     }
   });

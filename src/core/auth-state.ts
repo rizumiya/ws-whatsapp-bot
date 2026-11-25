@@ -3,12 +3,43 @@ import {
   BufferJSON,
   AuthenticationState,
   AuthenticationCreds,
-  SignalDataTypeMap
+  SignalDataTypeMap,
+  proto
 } from '@whiskeysockets/baileys';
 import { authKeyRepository } from '../repositories/auth-key.repository';
 import { redis } from '../config/redis';
 
 const CACHE_TTL = 86400; // 24 hours
+
+export const deleteRedisKeysByPattern = async (pattern: string): Promise<void> => {
+  return new Promise((resolve, reject) => {
+    const stream = redis.scanStream({ match: pattern, count: 100 });
+    const pipeline = redis.pipeline();
+    let count = 0;
+
+    stream.on('data', (keys: string[]) => {
+      if (keys.length > 0) {
+        for (const k of keys) {
+          pipeline.del(k);
+          count++;
+        }
+      }
+    });
+
+    stream.on('end', async () => {
+      try {
+        if (count > 0) {
+          await pipeline.exec();
+        }
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    stream.on('error', (err) => reject(err));
+  });
+};
 
 export const usePostgresAuthState = async (
   sessionId: string
@@ -30,9 +61,11 @@ export const usePostgresAuthState = async (
     
     // Try PostgreSQL
     if (!dataStr) {
-      dataStr = await authKeyRepository.get(sessionId, keyType, keyId);
-      if (dataStr) {
-        // Update cache
+      const dbVal = await authKeyRepository.get(sessionId, keyType, keyId);
+      if (dbVal !== null && dbVal !== undefined) {
+        // Kolom JSONB di PostgreSQL otomatis di-parse menjadi object oleh driver `pg`.
+        // Kita ubah kembali ke string JSON agar bisa disimpan ke Redis dan di-revive oleh BufferJSON.reviver.
+        dataStr = typeof dbVal === 'string' ? dbVal : JSON.stringify(dbVal);
         await redis.set(cacheKey, dataStr, 'EX', CACHE_TTL);
       }
     }
@@ -51,11 +84,8 @@ export const usePostgresAuthState = async (
 
   const clearState = async () => {
     await authKeyRepository.clearAll(sessionId);
-    // Clear all redis keys for this session
-    const keys = await redis.keys(`auth:${sessionId}:*`);
-    if (keys.length > 0) {
-      await redis.del(...keys);
-    }
+    // Clear all redis keys for this session using non-blocking SCAN
+    await deleteRedisKeysByPattern(`auth:${sessionId}:*`);
   };
 
   // 1. Init Creds
@@ -82,7 +112,7 @@ export const usePostgresAuthState = async (
             ids.map(async (id) => {
               let value = await readData(type, id);
               if (type === 'app-state-sync-key' && value) {
-                value = { ...value, syncKey: Buffer.from(value.syncKey, 'base64') };
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
               }
               data[id] = value;
             })

@@ -2,12 +2,11 @@ package handlers
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
-	"math/rand"
 
 	"github.com/gofiber/fiber/v2"
 	waBinary "go.mau.fi/whatsmeow/binary"
-
 
 	"golang-whatsapp-bot/internal/whatsapp"
 )
@@ -20,8 +19,8 @@ type RejectCallReq struct {
 func RejectCall(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() || session.Client.Store.ID == nil {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req RejectCallReq
@@ -52,8 +51,8 @@ type AcceptCallReq struct {
 func AcceptCall(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() || session.Client.Store.ID == nil {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req AcceptCallReq
@@ -95,7 +94,6 @@ func AcceptCall(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"success": true})
 }
 
-
 type OfferCallReq struct {
 	To        string `json:"to"`
 	MediaType string `json:"mediaType"` // "audio" or "video"
@@ -104,8 +102,8 @@ type OfferCallReq struct {
 func OfferCall(c *fiber.Ctx) error {
 	sessionID := c.Params("sessionId")
 	session, ok := whatsapp.Manager.GetSession(sessionID)
-	if !ok {
-		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active"}})
+	if !ok || !session.Client.IsLoggedIn() || session.Client.Store.ID == nil {
+		return c.Status(404).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Session not active or not logged in"}})
 	}
 
 	var req OfferCallReq
@@ -139,7 +137,7 @@ func OfferCall(c *fiber.Ctx) error {
 			{
 				Tag: "audio", // or video
 				Attrs: waBinary.Attrs{
-					"enc": "opus",
+					"enc":  "opus",
 					"rate": "16000",
 				},
 			},

@@ -1,6 +1,9 @@
 import { z } from 'zod';
 
-export const jidSchema = z.string().regex(/^[0-9]+(@s\.whatsapp\.net|@g\.us)$/, 'Invalid JID format. Must end with @s.whatsapp.net or @g.us');
+export const jidSchema = z.string().regex(
+  /^[0-9]+(-[0-9]+)?(@s\.whatsapp\.net|@g\.us|@lid|@newsletter)$/,
+  'Invalid JID format. Must end with @s.whatsapp.net, @g.us, @lid, or @newsletter'
+);
 
 export const sendTextSchema = z.object({
   to: jidSchema,

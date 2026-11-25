@@ -1,5 +1,6 @@
-import { WASocket } from '@whiskeysockets/baileys';
+import { DisconnectReason, WASocket } from '@whiskeysockets/baileys';
 import { startSocket } from './socket-handler';
+import { deleteRedisKeysByPattern } from './auth-state';
 import { logger } from '../utils/logger';
 import { sessionRepository } from '../repositories/session.repository';
 import { redis } from '../config/redis';
@@ -69,19 +70,22 @@ class SessionManager {
           this.sessions.delete(sessionId);
 
           // Handle reconnect if not logged out (401)
-          if (reason === 401) return;
+          if (reason === DisconnectReason.loggedOut) return;
 
-          const attempt = wasConnected ? 0 : retryCount;
+          // Kode 515 (restartRequired) selalu dikirim WhatsApp tepat sesudah QR berhasil dipindai:
+          // wajib langsung sambung ulang tanpa dihitung sebagai kegagalan koneksi.
+          const isRestartRequired = reason === DisconnectReason.restartRequired;
+          const attempt = wasConnected || isRestartRequired ? 0 : retryCount;
           if (attempt >= MAX_RECONNECT) {
             logger.error({ sessionId }, 'Max reconnect retries reached');
             return;
           }
 
-          const backoff = Math.min(1000 * Math.pow(2, attempt), 30000); // Max 30s
-          logger.info({ sessionId, backoff, retryCount: attempt }, 'Scheduling reconnect');
+          const backoff = isRestartRequired ? 500 : Math.min(1000 * Math.pow(2, attempt), 30000);
+          logger.info({ sessionId, backoff, retryCount: attempt, reason }, 'Scheduling reconnect');
           const timer = setTimeout(() => {
             this.reconnectTimers.delete(sessionId);
-            this.reconnect(sessionId, attempt + 1).catch(err => {
+            this.reconnect(sessionId, isRestartRequired ? 0 : attempt + 1).catch(err => {
               logger.error(err, `Reconnect failed for ${sessionId}`);
             });
           }, backoff);
@@ -151,13 +155,11 @@ class SessionManager {
     // ON DELETE CASCADE ikut menghapus session_auth_keys, webhook_logs, dan message_logs.
     await sessionRepository.delete(sessionId);
 
-    // sessionId hanya [a-zA-Z0-9_-], jadi aman dipakai di pola KEYS.
-    const keys = [
-      ...(await redis.keys(`auth:${sessionId}:*`)),
-      ...(await redis.keys(`message:${sessionId}:*`)),
-      `session:${sessionId}:qr`,
-    ];
-    await redis.del(...keys);
+    await Promise.all([
+      deleteRedisKeysByPattern(`auth:${sessionId}:*`),
+      deleteRedisKeysByPattern(`message:${sessionId}:*`),
+      redis.del(`session:${sessionId}:qr`),
+    ]);
   }
 
   public async restoreSessions(): Promise<void> {

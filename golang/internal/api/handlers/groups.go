@@ -254,7 +254,7 @@ func UpdateGroupDescription(c *fiber.Ctx) error {
 	}
 
 	var req GroupDescriptionReq
-	if err := c.BodyParser(&req); err != nil || req.Description == "" {
+	if err := c.BodyParser(&req); err != nil {
 		return c.Status(400).JSON(fiber.Map{"success": false, "error": fiber.Map{"message": "Invalid request"}})
 	}
 

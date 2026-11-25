@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"time"
 
 	"golang-whatsapp-bot/config"
 	_ "github.com/lib/pq"
@@ -39,8 +40,12 @@ func InitDB(cfg *config.Config) {
 		webhook_url TEXT,
 		status VARCHAR(32) DEFAULT 'IDLE',
 		jid VARCHAR(128) DEFAULT '',
-		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		phone_number VARCHAR(30) DEFAULT '',
+		created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 	);
+	ALTER TABLE api_sessions ADD COLUMN IF NOT EXISTS phone_number VARCHAR(30) DEFAULT '';
+	ALTER TABLE api_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP;
 	`
 	_, err = DB.Exec(createTableQuery)
 	if err != nil {
@@ -58,33 +63,38 @@ func InitDB(cfg *config.Config) {
 }
 
 func GetSessionData(sessionID string) (apiKey string, webhookURL string, status string, jid string, err error) {
+	var wh sql.NullString
 	query := `SELECT api_key, webhook_url, status, jid FROM api_sessions WHERE session_id = $1`
-	err = DB.QueryRow(query, sessionID).Scan(&apiKey, &webhookURL, &status, &jid)
+	err = DB.QueryRow(query, sessionID).Scan(&apiKey, &wh, &status, &jid)
+	if wh.Valid {
+		webhookURL = wh.String
+	}
 	return
 }
 
 func SaveSessionData(sessionID, apiKey, webhookURL, status string) error {
 	query := `
-		INSERT INTO api_sessions (session_id, api_key, webhook_url, status)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO api_sessions (session_id, api_key, webhook_url, status, updated_at)
+		VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
 		ON CONFLICT (session_id) DO UPDATE SET
 			api_key = EXCLUDED.api_key,
 			webhook_url = EXCLUDED.webhook_url,
-			status = EXCLUDED.status;
+			status = EXCLUDED.status,
+			updated_at = CURRENT_TIMESTAMP;
 	`
 	_, err := DB.Exec(query, sessionID, apiKey, webhookURL, status)
 	return err
 }
 
 func UpdateSessionStatus(sessionID, status string) error {
-	query := `UPDATE api_sessions SET status = $1 WHERE session_id = $2`
+	query := `UPDATE api_sessions SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE session_id = $2`
 	_, err := DB.Exec(query, status, sessionID)
 	return err
 }
 
-func UpdateSessionJID(sessionID, jid string) error {
-	query := `UPDATE api_sessions SET jid = $1 WHERE session_id = $2`
-	_, err := DB.Exec(query, jid, sessionID)
+func UpdateSessionJID(sessionID, jid, phoneNumber string) error {
+	query := `UPDATE api_sessions SET jid = $1, phone_number = $2, updated_at = CURRENT_TIMESTAMP WHERE session_id = $3`
+	_, err := DB.Exec(query, jid, phoneNumber, sessionID)
 	return err
 }
 
@@ -95,19 +105,19 @@ func DeleteSessionData(sessionID string) error {
 }
 
 func GetAllSessions() ([]map[string]interface{}, error) {
-	query := `SELECT session_id, webhook_url, status, jid, created_at FROM api_sessions`
+	query := `SELECT session_id, webhook_url, status, jid, COALESCE(phone_number, ''), created_at, COALESCE(updated_at, created_at) FROM api_sessions`
 	rows, err := DB.Query(query)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var sessions []map[string]interface{}
+	sessions := make([]map[string]interface{}, 0)
 	for rows.Next() {
-		var id, status, jid string
+		var id, status, jid, phoneNumber string
 		var webhookURL sql.NullString
-		var createdAt string
-		if err := rows.Scan(&id, &webhookURL, &status, &jid, &createdAt); err != nil {
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&id, &webhookURL, &status, &jid, &phoneNumber, &createdAt, &updatedAt); err != nil {
 			return nil, err
 		}
 
@@ -115,9 +125,11 @@ func GetAllSessions() ([]map[string]interface{}, error) {
 			"id":           id,
 			"status":       status,
 			"jid":          jid,
-			"created_at":   createdAt,
+			"phone_number": phoneNumber,
+			"created_at":   createdAt.Format(time.RFC3339),
+			"updated_at":   updatedAt.Format(time.RFC3339),
 		}
-		if webhookURL.Valid {
+		if webhookURL.Valid && webhookURL.String != "" {
 			session["webhook_url"] = webhookURL.String
 		} else {
 			session["webhook_url"] = nil

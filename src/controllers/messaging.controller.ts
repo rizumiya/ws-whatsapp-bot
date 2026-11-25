@@ -1,7 +1,9 @@
 import { Request, Response } from 'express';
 import { messagingService } from '../services/messaging.service';
-import { downloadMediaMessage, WAMessage } from '@whiskeysockets/baileys';
+import { BufferJSON, downloadMediaMessage, WAMessage } from '@whiskeysockets/baileys';
 import { redis } from '../config/redis';
+import { sessionManager } from '../core/session-manager';
+import { logger } from '../utils/logger';
 
 export const messagingController = {
   async sendText(req: Request, res: Response) {
@@ -110,14 +112,15 @@ export const messagingController = {
         return res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: 'Message media not found in cache. Media messages are only cached for 24 hours.' } });
       }
 
-      const msg: WAMessage = JSON.parse(cachedMsgStr);
+      const msg: WAMessage = JSON.parse(cachedMsgStr, BufferJSON.reviver);
+      const sock = sessionManager.getSession(sessionId);
       const buffer = await downloadMediaMessage(
         msg,
         'buffer',
         {},
         { 
-          logger: console as any,
-          reuploadRequest: (msg) => new Promise((resolve) => resolve(msg))
+          logger: logger.child({ module: 'media-download', sessionId }) as any,
+          reuploadRequest: sock ? sock.updateMediaMessage : async (m) => m
         }
       );
 
